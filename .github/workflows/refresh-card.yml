@@ -1,5 +1,6 @@
 # Daily refresh of the gh-ascii card (adapted from crafter-station/gh-ascii's example).
-# Uses the committed contrast-boosted portrait.jpg instead of the raw avatar, so the face stays sharp.
+# Hardened: the card comes from a third-party server, so it is treated as untrusted —
+# validated before commit, the network step holds no git credentials, and the action is pinned.
 # Heads-up: GitHub disables scheduled workflows after 60 days of repo inactivity; re-enable from the Actions tab.
 name: Refresh gh-ascii card
 
@@ -18,8 +19,11 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false   # no token on disk while we talk to the third-party server
 
       - name: Download both themes
         env:
@@ -28,12 +32,31 @@ jobs:
           COLS: "160"
         run: |
           for t in dark light; do
-            curl -fsSL --retry 3 --retry-delay 5 -X POST \
-              -F image=@portrait.jpg -F theme=$t -F cols=$COLS \
-              "$GH_ASCII_URL/$HANDLE" -o ${t}_mode.svg
+            curl -fsSL --proto '=https' --max-time 60 --max-filesize 2000000 --retry 3 --retry-delay 5 \
+              -X POST -F image=@portrait.jpg -F theme=$t -F cols=$COLS \
+              "$GH_ASCII_URL/$HANDLE" -o ${t}_mode.new
           done
 
+      - name: Validate cards (untrusted third-party output)
+        env:
+          HANDLE: shivkumr-ai
+        run: |
+          for f in dark_mode.new light_mode.new; do
+            size=$(wc -c < "$f")
+            # ponytail: grep allowlist/denylist, not a full SVG sanitizer; GitHub also serves SVGs sandboxed via <img>
+            [ "$size" -gt 5000 ] && [ "$size" -lt 2000000 ] || { echo "::error::$f size $size out of range"; exit 1; }
+            head -c 300 "$f" | grep -q '<svg' || { echo "::error::$f is not an SVG"; exit 1; }
+            grep -q "$HANDLE@github" "$f" || { echo "::error::$f does not contain the expected handle"; exit 1; }
+            if grep -Eiq '<script|<foreignObject|<iframe|<embed|<object|javascript:|data:text/html|[[:space:]]on[a-z]+[[:space:]]*=|(xlink:)?href[[:space:]]*=[[:space:]]*["'"'"'][[:space:]]*https?:' "$f"; then
+              echo "::error::$f contains active or external content — refusing to publish"; exit 1
+            fi
+          done
+          mv dark_mode.new dark_mode.svg
+          mv light_mode.new light_mode.svg
+
       - name: Commit only if the card changed
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -42,5 +65,5 @@ jobs:
             echo "Card unchanged — nothing to commit."
           else
             git commit -m "chore: refresh gh-ascii card"
-            git push
+            git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
           fi
